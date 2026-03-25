@@ -133,17 +133,32 @@ def clear_data(model):
     return True
 
 
-def save_data(model, *, num_experts: int = 72, save_path: str = DEFAULT_SAVE_PATH):
-    """Save collected data to disk (avoids large RPC transfer).
-
-    Args:
-        model: The vLLM model instance.
-        num_experts: Number of routed experts (default: 72).
-        save_path: Where to write the .pt file (default: /dev/shm/gate_data_raw.pt).
-    """
+def save_data(model):
+    """Save collected data to disk (avoids large RPC transfer)."""
     data = getattr(model, '_gate_data', {})
     if not data:
         return {"saved": False, "layers": 0}
+    save_path = DEFAULT_SAVE_PATH
+
+    # Detect num_experts from topk_ids shape
+    first_layer = next(iter(data.values()))
+    first_topk = first_layer["topk_ids"][0]
+    top_k = first_topk.shape[-1]
+    # Infer num_experts from gate weight
+    num_experts = 72  # default
+    m = model
+    for attr in ["language_model", "model"]:
+        inner = getattr(m, attr, None)
+        if inner is not None:
+            m = inner
+    layers = getattr(m, "layers", getattr(getattr(m, "model", None), "layers", None))
+    if layers:
+        for layer in layers:
+            mlp = getattr(layer, "mlp", None)
+            gate = getattr(mlp, "gate", None) if mlp else None
+            if gate and hasattr(gate, "weight"):
+                num_experts = gate.weight.shape[0]
+                break
     processed = {}
     total_samples = 0
     for li, d in data.items():

@@ -133,8 +133,9 @@ def main():
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
 
-    # Load data from disk
-    raw = torch.load("/dev/shm/gate_data_raw.pt", map_location="cpu")
+    # Load data from disk (hooks.py saves to DEFAULT_SAVE_PATH)
+    from predictor.hooks import DEFAULT_SAVE_PATH
+    raw = torch.load(DEFAULT_SAVE_PATH, map_location="cpu")
     training_data = {}
     for pi, li in enumerate(moe_layers):
         if li in raw:
