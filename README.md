@@ -91,12 +91,20 @@ The predictor uses vLLM's `apply_model()` API to hook into the model's MoE layer
 
 ## Validated results
 
-Trained and validated on `0xSero/Kimi-K2.5-PRISM-REAP-72` with 8x H100 80GB:
+Trained and live-validated on `0xSero/Kimi-K2.5-PRISM-REAP-72` with 8x H100 80GB, using exact gate output as ground truth (captured via vLLM forward hooks):
 
-- **Prefill accuracy: 96.7%** — predictor matches gate routing on prompt processing
-- **Training accuracy: 96.4%** avg, 93.4% min, 98.2% max across 60 MoE layers
-- **Predictor size: 449MB** (112M params, dim=256)
-- **Training time: ~70s** on single GPU after data collection
+| Phase | dim=256 | dim=512 | dim=1024 |
+|-------|---------|---------|----------|
+| Training accuracy | 86.1% | 90.9% | 93.8% |
+| Live prefill | 85.2% | — | 86.8% |
+| Live decode (32 tok) | ~61% | — | ~63% |
+
+- **Prefill accuracy tracks training accuracy** — ground truth is consistent
+- **Decode accuracy is lower** because autoregressive hidden states are harder to predict from pre-MoE representations alone
+- **Training time: ~70s** per dim on single GPU after data collection
+- **Data collection: ~20 min** (30 prompts × 256 tokens via vLLM offline inference)
+
+The decode accuracy gap is a fundamental limitation of predicting routing from hidden states before the MoE gate — not a model capacity issue. For NVMe expert prefetching (the primary use case), prefill accuracy is the critical metric.
 
 ## License
 

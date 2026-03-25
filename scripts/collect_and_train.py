@@ -57,7 +57,7 @@ def main():
     parser.add_argument("--n-gpus", type=int, default=1, help="Number of GPUs for tensor parallelism")
     parser.add_argument("--predictor-dim", type=int, default=256, help="Predictor hidden dimension")
     parser.add_argument("--epochs", type=int, default=100, help="Training epochs")
-    parser.add_argument("--max-tokens", type=int, default=32, help="Tokens to generate per prompt (captures decode phase)")
+    parser.add_argument("--max-tokens", type=int, default=256, help="Tokens to generate per prompt (captures decode phase)")
     parser.add_argument("--n-prompts", type=int, default=30, help="Number of calibration prompts")
     parser.add_argument("--max-model-len", type=int, default=2048, help="vLLM max model length")
     parser.add_argument("--gpu-mem-util", type=float, default=0.85, help="GPU memory utilization")
