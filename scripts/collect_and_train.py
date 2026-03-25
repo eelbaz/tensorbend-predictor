@@ -56,9 +56,9 @@ def main():
     parser.add_argument("--output", default="predictor.pt", help="Output predictor path")
     parser.add_argument("--n-gpus", type=int, default=1, help="Number of GPUs for tensor parallelism")
     parser.add_argument("--predictor-dim", type=int, default=256, help="Predictor hidden dimension")
-    parser.add_argument("--epochs", type=int, default=100, help="Training epochs")
-    parser.add_argument("--max-tokens", type=int, default=256, help="Tokens to generate per prompt (captures decode phase)")
-    parser.add_argument("--n-prompts", type=int, default=30, help="Number of calibration prompts")
+    parser.add_argument("--epochs", type=int, default=200, help="Training epochs")
+    parser.add_argument("--max-tokens", type=int, default=32, help="Tokens to generate per prompt (captures decode phase)")
+    parser.add_argument("--n-prompts", type=int, default=100, help="Number of calibration prompts")
     parser.add_argument("--max-model-len", type=int, default=2048, help="vLLM max model length")
     parser.add_argument("--gpu-mem-util", type=float, default=0.85, help="GPU memory utilization")
     args = parser.parse_args()
@@ -88,7 +88,7 @@ def main():
     print("\n=== Phase 2: Hooking MoE gates ===", flush=True)
     from predictor.hooks import (
         setup_collection_hooks, activate_hooks, deactivate_hooks,
-        reset_routing, save_data,
+        clear_data, save_data,
     )
     results = llm.apply_model(setup_collection_hooks)
     moe_layers = results[0] if results else []
@@ -111,7 +111,6 @@ def main():
     sampling = SamplingParams(max_tokens=args.max_tokens, temperature=0.0)
     llm.apply_model(activate_hooks)
     for i, prompt in enumerate(prompts):
-        llm.apply_model(reset_routing)
         try:
             llm.generate([prompt], sampling)
             print(f"  [{i+1}/{len(prompts)}] {prompt[:45]}... done", flush=True)

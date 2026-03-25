@@ -1,9 +1,10 @@
 """vLLM model hooks for routing data collection.
 
-Captures exact gate output (router_logits) as ground truth by hooking
-both the MoE forward (for hidden states) and the gate forward (for the
-actual routing decision). This avoids numerical mismatch from manually
-replicating the gate computation.
+Captures exact gate output (router_logits) as ground truth using a SINGLE
+gate forward hook that records both the gate's input (hidden_states) and
+output (router_logits -> topk). This avoids numerical mismatch from manually
+replicating the gate computation and eliminates the complexity of coordinating
+two separate hooks.
 
 All functions are module-level for pickle compatibility with vLLM's
 apply_model() multiprocess RPC.
@@ -11,22 +12,41 @@ apply_model() multiprocess RPC.
 import torch
 
 
-def setup_collection_hooks(model):
-    """Install pre-MoE + gate hooks for exact ground truth routing capture.
+# Configurable defaults — override before calling setup_collection_hooks()
+DEFAULT_TOP_K = 8
+DEFAULT_MAX_SAMPLES = 10000
+DEFAULT_BATCH_SLICE = 4
+DEFAULT_SAVE_PATH = "/dev/shm/gate_data_raw.pt"
 
-    Uses two hooks per MoE layer:
-    1. MoE pre-forward hook: captures hidden_states BEFORE the MoE runs
-    2. Gate forward hook: captures router_logits from the actual gate kernel
 
-    The gate runs BEFORE the MoE forward in vLLM's overlapped mode, so
-    the gate hook fires first and caches logits. The MoE hook fires second
-    and pairs the cached logits with the hidden states.
+def setup_collection_hooks(
+    model,
+    *,
+    top_k: int = DEFAULT_TOP_K,
+    max_samples: int = DEFAULT_MAX_SAMPLES,
+    batch_slice: int = DEFAULT_BATCH_SLICE,
+):
+    """Install single gate forward hooks for exact ground truth routing capture.
+
+    Uses ONE hook per MoE layer on the gate module. The gate forward hook
+    captures both:
+    1. Gate input  = exact hidden_states the gate sees
+    2. Gate output = exact router_logits from the kernel
+
+    This is simpler and more reliable than the dual-hook approach (separate
+    MoE pre-forward + gate forward hooks) because there is no need to
+    synchronize cached logits between two hooks.
+
+    Args:
+        model: The vLLM model instance.
+        top_k: Number of top experts to record (default: 8).
+        max_samples: Maximum samples to collect per layer (default: 10000).
+        batch_slice: Max tokens to keep per forward pass (default: 4).
     """
     if not hasattr(model, '_gate_data'):
         model._gate_data = {}
         model._gate_active = False
         model._gate_hooks = []
-        model._gate_logits_cache = {}
 
     m = model
     for attr in ["language_model", "model"]:
@@ -59,78 +79,40 @@ def setup_collection_hooks(model):
             num_experts = gate.weight.shape[0]
         bias_param = getattr(gate, 'e_score_correction_bias', None)
 
-        # Hook 1: Gate forward — captures exact router_logits from the kernel
-        def make_gate_hook(idx, ne, gate_bias, tp_r, mdl=model):
-            def hook(module, inputs, output):
-                if not mdl._gate_active or tp_r != 0:
-                    return
-                try:
-                    # Gate returns (router_logits, None)
-                    logits = output[0] if isinstance(output, tuple) else output
-                    # Apply same scoring as FusedMoE: sigmoid + bias
-                    scores = torch.sigmoid(logits.detach().float())
-                    if gate_bias is not None:
-                        scores = scores + gate_bias.detach().float()
-                    topk = scores.topk(8, dim=-1)[1]
-                    # Cache for the MoE hook to pick up
-                    mdl._gate_logits_cache[idx] = topk.cpu()
-                except Exception:
-                    pass
-            return hook
-
-        # Hook 2: MoE forward — captures hidden_states and pairs with cached gate output
-        def make_moe_hook(idx, ne, tp_r, mdl=model):
-            max_samples = 2000
-
+        # Single gate hook: captures BOTH the gate's actual input (hidden_states)
+        # AND its output (router_logits -> topk). This guarantees the predictor
+        # trains on the exact same hidden_states the gate uses.
+        def make_gate_hook(idx, ne, gate_bias, tp_r, mdl=model,
+                           _top_k=top_k, _max=max_samples, _bs=batch_slice):
             def hook(module, inputs, output):
                 if not mdl._gate_active or tp_r != 0:
                     return
                 existing = len(mdl._gate_data.get(idx, {}).get("hidden", []))
-                if existing >= max_samples:
+                if existing >= _max:
                     return
                 try:
-                    h = inputs[0]
-                    if isinstance(h, tuple):
-                        h = h[0]
+                    # Gate input = exact hidden_states the gate sees
+                    h = inputs[0].detach()
+                    h_flat = h.reshape(-1, h.shape[-1])
 
-                    # Get the exact topk from gate hook
-                    topk = mdl._gate_logits_cache.get(idx)
-                    if topk is None:
-                        # Gate hook didn't fire (non-overlapped path)
-                        # Fall back to manual computation
-                        gate_mod = getattr(module, 'gate', None)
-                        if gate_mod is None:
-                            return
-                        h_flat = h.detach().reshape(-1, h.shape[-1])
-                        gate_w = gate_mod.weight.detach()
-                        logits = h_flat.float() @ gate_w.float().t()
-                        scores = torch.sigmoid(logits)
-                        bias = getattr(gate_mod, 'e_score_correction_bias', None)
-                        if bias is not None:
-                            scores = scores + bias.detach().float()
-                        topk = scores.topk(8, dim=-1)[1].cpu()
-                        h_cpu = h_flat[:min(h_flat.shape[0], 4)].float().cpu()
-                    else:
-                        h_flat = h.detach().reshape(-1, h.shape[-1])
-                        n = min(h_flat.shape[0], topk.shape[0], 4)
-                        h_cpu = h_flat[:n].float().cpu()
-                        topk = topk[:n]
-                        del mdl._gate_logits_cache[idx]
+                    # Gate output = exact router_logits from the kernel
+                    logits = output[0] if isinstance(output, tuple) else output
+                    scores = torch.sigmoid(logits.detach().float())
+                    if gate_bias is not None:
+                        scores = scores + gate_bias.detach().float()
+                    topk = scores.topk(_top_k, dim=-1)[1]
 
-                    n = min(h_cpu.shape[0], topk.shape[0], max_samples - existing)
+                    n = min(h_flat.shape[0], topk.shape[0], _max - existing, _bs)
                     if idx not in mdl._gate_data:
                         mdl._gate_data[idx] = {"hidden": [], "topk_ids": []}
-                    mdl._gate_data[idx]["hidden"].append(h_cpu[:n])
-                    mdl._gate_data[idx]["topk_ids"].append(topk[:n])
+                    mdl._gate_data[idx]["hidden"].append(h_flat[:n].float().cpu())
+                    mdl._gate_data[idx]["topk_ids"].append(topk[:n].cpu())
                 except Exception:
                     pass
             return hook
 
         model._gate_hooks.append(
             gate.register_forward_hook(make_gate_hook(li, num_experts, bias_param, tp_rank))
-        )
-        model._gate_hooks.append(
-            mlp.register_forward_hook(make_moe_hook(li, num_experts, tp_rank))
         )
 
     return moe_indices
@@ -146,22 +128,22 @@ def deactivate_hooks(model):
     return True
 
 
-def reset_routing(model):
-    model._gate_logits_cache = {}
-    return True
-
-
 def clear_data(model):
     model._gate_data = {}
     return True
 
 
-def save_data(model):
-    """Save collected data to /dev/shm (avoids large RPC transfer)."""
+def save_data(model, *, num_experts: int = 72, save_path: str = DEFAULT_SAVE_PATH):
+    """Save collected data to disk (avoids large RPC transfer).
+
+    Args:
+        model: The vLLM model instance.
+        num_experts: Number of routed experts (default: 72).
+        save_path: Where to write the .pt file (default: /dev/shm/gate_data_raw.pt).
+    """
     data = getattr(model, '_gate_data', {})
     if not data:
         return {"saved": False, "layers": 0}
-    num_experts = 72
     processed = {}
     total_samples = 0
     for li, d in data.items():
@@ -185,7 +167,7 @@ def save_data(model):
             prev_r = target
         processed[li] = (list(h_cat), targets, prev_routings)
         total_samples += N
-    torch.save(processed, "/dev/shm/gate_data_raw.pt")
+    torch.save(processed, save_path)
     return {"saved": True, "layers": len(processed), "total_samples": total_samples}
 
 

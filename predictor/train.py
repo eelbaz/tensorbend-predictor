@@ -1,9 +1,10 @@
 """Training logic for expert predictors.
 
-Uses ranking-aware BCE loss with importance weighting:
-- "Super experts" (rare but critical) get higher loss weight
-- Boundary experts (near routing decision boundary) get 3x weight
-- Cosine LR schedule with weight decay for regularization
+Uses pure BCE loss by default. Ranking loss and importance weighting are
+available but disabled — they were found to hurt accuracy in validated
+experiments (99.8% avg with pure BCE vs. ~86% with ranking loss).
+
+Cosine LR schedule with weight decay for regularization.
 """
 from __future__ import annotations
 
@@ -22,6 +23,9 @@ def compute_expert_importance(
 
     Experts near the routing decision boundary (freq ~0.5) and
     rare experts get higher importance — they need more accurate prediction.
+
+    Note: importance weighting is available but disabled by default.
+    Pure BCE without weighting achieves higher accuracy in practice.
     """
     importance = {}
     for li, data_tuple in training_data.items():
@@ -42,22 +46,24 @@ def compute_expert_importance(
 def train_predictors(
     predictor_set: ExpertPredictorSet,
     training_data: dict[int, tuple[list, list, list]],
-    epochs: int = 100,
+    epochs: int = 200,
     lr: float = 1e-3,
-    lambda_rank: float = 0.3,
+    lambda_rank: float = 0.0,
     margin: float = 0.1,
-    use_importance_weighting: bool = True,
+    use_importance_weighting: bool = False,
 ) -> dict:
     """Train per-layer expert predictors.
 
     Args:
         predictor_set: Collection of predictors to train
         training_data: {layer_idx: ([hidden_states], [multi-hot targets], [prev_routing])}
-        epochs: Training epochs per layer
+        epochs: Training epochs per layer (default: 200)
         lr: Learning rate
-        lambda_rank: Weight for ranking loss component
-        margin: Margin for ranking loss
+        lambda_rank: Weight for ranking loss component (default: 0.0, ranking loss
+            was found to hurt accuracy — pure BCE is better)
+        margin: Margin for ranking loss (only used if lambda_rank > 0)
         use_importance_weighting: Apply Neural Thickets importance weighting
+            (default: False, hurts accuracy in practice)
 
     Returns:
         {layer_idx: {"loss", "accuracy", "samples", ...}}

@@ -2,14 +2,14 @@
 
 Cross-layer expert predictor for Mixture-of-Experts models. Predicts which experts the router will select **before** the gate runs, enabling prefetch of expert weights from NVMe/DRAM or pre-staging of EP all2all buffers.
 
-Trains a lightweight MLP per MoE layer that takes the pre-MoE hidden states + previous layer's routing decision as input, achieving 96%+ top-8 routing overlap on DeepSeek-style MoE architectures.
+Trains a lightweight MLP per MoE layer that takes the pre-MoE hidden states + previous layer's routing decision as input, achieving 99.8% training accuracy and 96.9% live prefill accuracy on DeepSeek-style MoE architectures.
 
 ## How it works
 
 Each MoE layer has a gate that selects top-k experts based on hidden states. The predictor learns to approximate this gate using:
 
-1. **Hidden states before MoE** — the same signal the gate uses
-2. **Previous layer's routing** — exploits 50-60% cross-layer expert overlap
+1. **Hidden states before MoE** -- the same signal the gate uses
+2. **Previous layer's routing** -- exploits 50-60% cross-layer expert overlap
 
 This runs in <0.05ms per layer on GPU, fast enough to hide expert loading latency during the attention phase.
 
@@ -30,7 +30,7 @@ pip install -r requirements.txt
 ### Train a predictor
 
 ```bash
-# Single GPU (RTX 3090/4090) — small models or with reduced context
+# Single GPU (RTX 3090/4090) -- small models or with reduced context
 python scripts/collect_and_train.py \
     --model-dir /path/to/model \
     --output predictor.pt \
@@ -39,7 +39,7 @@ python scripts/collect_and_train.py \
     --max-model-len 1024 \
     --gpu-mem-util 0.90
 
-# Multi-GPU (8x H100) — large models
+# Multi-GPU (8x H100) -- large models
 python scripts/collect_and_train.py \
     --model-dir /path/to/model \
     --output predictor.pt \
@@ -63,7 +63,7 @@ python scripts/collect_and_train.py \
 |-----|-------------|-------------------|------|-----------------|
 | 64 | 463K | 28M | 112MB | ~80% |
 | 128 | 926K | 56M | 225MB | ~89% |
-| 256 | 1.8M | 112M | 449MB | ~96% |
+| 256 | 1.8M | 112M | 449MB | ~99% |
 | 512 | 3.7M | 225M | 899MB | ~99% |
 
 `--predictor-dim 256` is the recommended default. Use 128 for memory-constrained setups.
@@ -72,7 +72,7 @@ python scripts/collect_and_train.py \
 
 | Model | Experts | Validated |
 |-------|---------|-----------|
-| `0xSero/Kimi-K2.5-PRISM-REAP-72` | 72 | 96.4% accuracy (dim=256, 8x H100) |
+| `0xSero/Kimi-K2.5-PRISM-REAP-72` | 72 | 99.8% train / 96.9% prefill (dim=256, 8x H100) |
 | `Ex0bit/Kimi-K2.5-PRISM-REAP-530B-A32B` | 192 | Architecture compatible (untested on this tool) |
 
 ## Architecture
@@ -81,30 +81,32 @@ python scripts/collect_and_train.py \
 predictor/
     __init__.py          # Public API
     model.py             # ExpertPredictor, ExpertPredictorSet
-    train.py             # Training loop with importance weighting
-    hooks.py             # vLLM model hooks for data collection
+    train.py             # Training loop (pure BCE, no ranking loss)
+    hooks.py             # vLLM single gate hook for data collection
 scripts/
     collect_and_train.py # End-to-end training script
 ```
 
-The predictor uses vLLM's `apply_model()` API to hook into the model's MoE layers during inference, capturing hidden states and actual routing decisions. This avoids the need for HF `from_pretrained` loading (which has compatibility issues with compressed-tensors W4A16 quantization).
+The predictor uses vLLM's `apply_model()` API to hook into the model's MoE layers during inference, capturing hidden states and actual routing decisions. A single gate forward hook captures both the gate's input (hidden_states) and output (router_logits), guaranteeing exact ground truth.
 
 ## Validated results
 
-Trained and live-validated on `0xSero/Kimi-K2.5-PRISM-REAP-72` with 8x H100 80GB, using exact gate output as ground truth (captured via vLLM forward hooks):
+Trained and live-validated on `0xSero/Kimi-K2.5-PRISM-REAP-72` with 8x H100 80GB, using exact gate output as ground truth (captured via single vLLM gate forward hook):
 
-| Phase | dim=256 | dim=512 | dim=1024 |
-|-------|---------|---------|----------|
-| Training accuracy | 86.1% | 90.9% | 93.8% |
-| Live prefill | 85.2% | — | 86.8% |
-| Live decode (32 tok) | ~61% | — | ~63% |
+| Phase | dim=256, 100 prompts, pure BCE |
+|-------|-------------------------------|
+| Training accuracy | 99.8% avg (min 99.4%) |
+| Live prefill | 96.9% |
+| Live decode (32 tok) | ~69% |
 
-- **Prefill accuracy tracks training accuracy** — ground truth is consistent
-- **Decode accuracy is lower** because autoregressive hidden states are harder to predict from pre-MoE representations alone
-- **Training time: ~70s** per dim on single GPU after data collection
-- **Data collection: ~20 min** (30 prompts × 256 tokens via vLLM offline inference)
+### Key findings
 
-The decode accuracy gap is a fundamental limitation of predicting routing from hidden states before the MoE gate — not a model capacity issue. For NVMe expert prefetching (the primary use case), prefill accuracy is the critical metric.
+- **Pure BCE is better** -- ranking loss (`lambda_rank > 0`) and importance weighting both hurt accuracy. The defaults reflect this: `lambda_rank=0.0`, `use_importance_weighting=False`.
+- **100 prompts >> 30 prompts** -- more calibration data improves generalization significantly. Default is now 100 prompts.
+- **Single gate hook** -- captures both input and output in one hook, eliminating the complexity and race conditions of the old dual-hook approach.
+- **Prefill accuracy tracks training accuracy** -- ground truth is consistent.
+- **Decode accuracy (~69%) is an architectural ceiling** for feedforward predictors. Autoregressive hidden states during decode are harder to predict from pre-MoE representations alone. This is not a model capacity issue.
+- For NVMe expert prefetching (the primary use case), prefill accuracy is the critical metric.
 
 ## License
 
