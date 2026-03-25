@@ -1,0 +1,6 @@
+torch>=2.1.0
+vllm>=0.6.6
+transformers>=4.49.0
+safetensors
+huggingface-hub
+datasets
